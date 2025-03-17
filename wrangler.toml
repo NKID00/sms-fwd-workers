@@ -1,0 +1,10 @@
+name = "sms-fwd-workers"
+main = "build/worker/shim.mjs"
+compatibility_date = "2025-03-15"
+
+[[routes]]
+pattern = "sms.nk0.uk"
+custom_domain = true
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
