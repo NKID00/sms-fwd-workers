@@ -1,13 +1,12 @@
 #![feature(let_chains)]
 
-use std::sync::OnceLock;
+use std::{fmt::Display, sync::OnceLock};
 
 use itertools::Itertools;
-use regex::Regex;
+use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use worker::*;
 
-static RE_SMS_HAS_CODE: OnceLock<Regex> = OnceLock::new();
 static RE_CODE: OnceLock<Regex> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
@@ -24,17 +23,18 @@ impl AppleMessageFilterQuery {
     fn text(&self) -> &str {
         &self.inner.message.text
     }
+}
 
-    fn code(&self) -> Option<&str> {
-        if !RE_SMS_HAS_CODE.get().unwrap().is_match(self.text()) {
-            return None;
-        }
-        RE_CODE
+impl Display for AppleMessageFilterQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let escaped = escape_html(self.text());
+        let text = RE_CODE
             .get()
             .unwrap()
-            .captures(self.text())?
-            .get(1)
-            .map(|m| m.as_str())
+            .replace_all(&escaped, |c: &Captures| {
+                format!(" 👉 <code>{}</code> 👈 ", c.get(0).unwrap().as_str())
+            });
+        write!(f, "<code>{}</code>\n\n{}", self.sender(), text)
     }
 }
 
@@ -56,12 +56,18 @@ struct SendMessageBody {
     parse_mode: String,
 }
 
-fn authorize(req: &Request, env: &Env) -> Option<String> {
-    if req.method() != Method::Post {
+fn authorize(req: &Request, env: &Env) -> Option<(String, String)> {
+    if !matches!(req.method(), Method::Get | Method::Post) {
         return None;
     }
-    let authorization = req.headers().get("Authorization").unwrap()?;
-    let authorization = authorization.trim().trim_start_matches("Bearer ");
+    let authorization = match req.headers().get("Authorization").unwrap() {
+        Some(s) => s.trim().trim_start_matches("Bearer ").to_owned(),
+        None => req
+            .path()
+            .trim_start_matches("/")
+            .trim_end_matches("/")
+            .to_owned(),
+    };
     let (device, token) = authorization.splitn(2, '/').collect_tuple()?;
     let Ok(secret) = env.secret(device) else {
         return None;
@@ -69,7 +75,7 @@ fn authorize(req: &Request, env: &Env) -> Option<String> {
     if token != secret.to_string() {
         return None;
     }
-    Some(device.to_string())
+    Some((device.to_owned(), token.to_owned()))
 }
 
 fn escape_html(s: &str) -> String {
@@ -78,15 +84,14 @@ fn escape_html(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-#[event(fetch)]
-async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
-    if let Some(device) = authorize(&req, &env)
-        && let Ok(body) = req.bytes().await
-    {
-        ctx.wait_until(forward(device, body, env));
-    }
-    Response::empty()
+async fn generate_config(device: String, token: String, env: Env) -> Result<String> {
+    let url = env.secret("config_template_url")?.to_string();
+    let request = Request::new(&url, Method::Get)?;
+    let template = Fetch::Request(request).send().await?.text().await?;
+    Ok(template.replace("{{token}}", &format!("{device}/{token}")))
 }
+
+async fn heartbeat(device: String, env: Env) {}
 
 async fn forward(device: String, body: Vec<u8>, env: Env) {
     let Ok(bot_token) = env.secret(&format!("{device}_bot_token")) else {
@@ -98,21 +103,9 @@ async fn forward(device: String, body: Vec<u8>, env: Env) {
         return;
     };
     let text = match serde_json::from_slice::<AppleMessageFilterQuery>(&body) {
-        Ok(query) => match query.code() {
-            Some(code) => format!(
-                "{} <code>{}</code> <b>[<code>{}</code>]</b>\n\n{}",
-                device,
-                escape_html(query.sender()),
-                code,
-                escape_html(query.text())
-            ),
-            None => format!(
-                "{} <code>{}</code>\n\n{}",
-                device,
-                escape_html(query.sender()),
-                escape_html(query.text())
-            ),
-        },
+        Ok(query) => {
+            format!("{device} {query}")
+        }
         Err(_) => {
             format!(
                 "{}\n\n<pre>{}</pre>",
@@ -131,7 +124,7 @@ async fn forward(device: String, body: Vec<u8>, env: Env) {
         &format!("https://api.telegram.org/bot{bot_token}/sendMessage"),
         &RequestInit {
             method: Method::Post,
-            headers: [("content-type", "application/json")].into_iter().collect(),
+            headers: [("Content-Type", "application/json")].into_iter().collect(),
             body: Some(body.into()),
             ..RequestInit::default()
         },
@@ -145,6 +138,38 @@ async fn forward(device: String, body: Vec<u8>, env: Env) {
     };
 }
 
+#[event(fetch)]
+async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
+    let Some((device, token)) = authorize(&req, &env) else {
+        return Response::empty();
+    };
+    if req.method() == Method::Get {
+        Ok(Response::builder()
+            .with_headers(
+                [
+                    ("Content-Type", "text/plain; charset=utf-8"),
+                    ("Content-Disposition", "inline; filename=\"sms-forward.yaml\""),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .fixed(
+                generate_config(device, token, env)
+                    .await
+                    .unwrap_or_default()
+                    .into_bytes(),
+            ))
+    } else {
+        let body = req.bytes().await.unwrap();
+        if body.is_empty() {
+            ctx.wait_until(heartbeat(device, env));
+        } else {
+            ctx.wait_until(forward(device, body, env));
+        }
+        Response::empty()
+    }
+}
+
 #[allow(unused)]
 #[event(scheduled)]
 async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {}
@@ -152,14 +177,5 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {}
 #[event(start)]
 fn start() {
     console_error_panic_hook::set_once();
-    RE_SMS_HAS_CODE.get_or_init(|| {
-        Regex::new(
-            r"验证码|校验码|交易码|[Cc](?:ODE|ode)|[Vv](?:ERIFY|erify|ERIFICATION|erification)",
-        )
-        .unwrap()
-    });
-    RE_CODE.get_or_init(|| {
-        Regex::new(r"(?:^|[[:^digit:]])((?:[[:alnum:]]-)?[[:digit:]]{4,8})(?:$|[[:^digit:]])")
-            .unwrap()
-    });
+    RE_CODE.get_or_init(|| Regex::new(r"(?:[[:alnum:]]-)?[[:digit:]]{6}").unwrap());
 }
