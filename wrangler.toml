@@ -8,3 +8,10 @@ custom_domain = true
 
 [build]
 command = "cargo install -q worker-build && worker-build --release"
+
+[[kv_namespaces]]
+binding = "sms-forward-heartbeat"
+id = "b2c8d62f05064a43b2e98ddb459165d8"
+
+[triggers]
+crons = ["2-59/5 * * * *"]

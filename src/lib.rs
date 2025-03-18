@@ -3,9 +3,12 @@
 use std::{fmt::Display, sync::OnceLock};
 
 use itertools::Itertools;
+use js_sys::Date;
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
-use worker::*;
+use worker::{kv::KvStore, *};
+
+const HEARTBEAT_INTERVAL_SECONDS: i64 = 300;
 
 static RE_CODE: OnceLock<Regex> = OnceLock::new();
 
@@ -50,10 +53,113 @@ struct AppleMessageFilterQueryMessage {
 }
 
 #[derive(Debug, Serialize)]
-struct SendMessageBody {
-    chat_id: String,
-    text: String,
-    parse_mode: String,
+struct SendMessageBody<'a> {
+    chat_id: &'a str,
+    text: &'a str,
+    parse_mode: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct SendStickerBody<'a> {
+    chat_id: &'a str,
+    sticker: &'a str,
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn timestamp_ms() -> i64 {
+    Date::new_0().get_time() as i64
+}
+
+fn get_secret(env: &Env, key: &str) -> String {
+    env.secret(key)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| panic!("secret {key} not found"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeartbeatStatus {
+    Active,   // ..(interval * 1.5)
+    Inactive, // (interval * 1.5)..(interval * 2.5)
+    Dead,     // (interval * 2.5)..
+}
+
+use HeartbeatStatus::*;
+
+impl HeartbeatStatus {
+    async fn get(kv: &KvStore, device: &str) -> Self {
+        let result = kv.get(device).text().await.expect("failed to access kv");
+        if let Some(v) = result
+            && let Ok(previous_timestamp_ms) = v.parse::<i64>()
+        {
+            let interval = timestamp_ms() - previous_timestamp_ms;
+            if interval < HEARTBEAT_INTERVAL_SECONDS * 1500 {
+                return Active;
+            } else if interval < HEARTBEAT_INTERVAL_SECONDS * 2500 {
+                return Inactive;
+            }
+        }
+        Dead
+    }
+}
+
+fn get_chat_info(env: &Env, device: &str) -> (String, String) {
+    (
+        get_secret(env, &format!("{device}_bot_token")),
+        get_secret(env, &format!("{device}_chat_id")),
+    )
+}
+
+async fn send_message(env: &Env, device: &str, text: &str) {
+    let (bot_token, chat_id) = get_chat_info(env, device);
+    let body = serde_json::to_string(&SendMessageBody {
+        chat_id: &chat_id.to_string(),
+        text,
+        parse_mode: "HTML",
+    })
+    .unwrap();
+    let request = Request::new_with_init(
+        &format!("https://api.telegram.org/bot{bot_token}/sendMessage"),
+        &RequestInit {
+            method: Method::Post,
+            headers: [("Content-Type", "application/json")].into_iter().collect(),
+            body: Some(body.into()),
+            ..RequestInit::default()
+        },
+    )
+    .unwrap();
+    match Fetch::Request(request).send().await {
+        Ok(response) => console_debug!("{response:?}"),
+        Err(e) => console_error!("sendMessage failed: {e:?}"),
+    };
+}
+
+async fn send_sticker(env: &Env, device: &str, sticker: &str) {
+    let bot_token = get_secret(env, &format!("{device}_bot_token"));
+    let chat_id = get_secret(env, &format!("{device}_chat_id"));
+    let body = serde_json::to_string(&SendStickerBody {
+        chat_id: &chat_id.to_string(),
+        sticker,
+    })
+    .unwrap();
+    let request = Request::new_with_init(
+        &format!("https://api.telegram.org/bot{bot_token}/sendSticker"),
+        &RequestInit {
+            method: Method::Post,
+            headers: [("Content-Type", "application/json")].into_iter().collect(),
+            body: Some(body.into()),
+            ..RequestInit::default()
+        },
+    )
+    .unwrap();
+    match Fetch::Request(request).send().await {
+        Ok(response) => console_debug!("{response:?}"),
+        Err(e) => console_error!("sendSticker failed: {e:?}"),
+    };
 }
 
 fn authorize(req: &Request, env: &Env) -> Option<(String, String)> {
@@ -78,33 +184,51 @@ fn authorize(req: &Request, env: &Env) -> Option<(String, String)> {
     Some((device.to_owned(), token.to_owned()))
 }
 
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-async fn generate_config(device: String, token: String, env: Env) -> Result<String> {
-    let url = env.secret("config_template_url")?.to_string();
+async fn generate_config(device: String, token: String, env: Env) -> Result<Response> {
+    let url = get_secret(&env, "config_template_url");
     let request = Request::new(&url, Method::Get)?;
     let template = Fetch::Request(request).send().await?.text().await?;
-    Ok(template.replace("{{token}}", &format!("{device}/{token}")))
+    let body = template
+        .replace("{{token}}", &format!("{device}/{token}"))
+        .into_bytes();
+    Ok(Response::builder()
+        .with_headers(
+            [
+                ("Content-Type", "text/plain; charset=utf-8"),
+                (
+                    "Content-Disposition",
+                    "inline; filename=\"sms-forward.yaml\"",
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .fixed(body))
 }
 
-async fn heartbeat(device: String, env: Env) {}
+async fn heartbeat(device: String, env: Env) {
+    let kv = env.kv("sms-forward-heartbeat").unwrap();
+    let status = HeartbeatStatus::get(&kv, &device).await;
+    console_debug!("heartbeat for {device}, previous {status:?}");
+    if status != Active {
+        send_message(&env, &device, &format!("🟢 {device} is now up")).await;
+        send_sticker(&env, &device, &get_secret(&env, "up_sticker")).await;
+    }
+    if let Err(e) = kv
+        .put(&device, timestamp_ms())
+        .unwrap()
+        .expiration_ttl((HEARTBEAT_INTERVAL_SECONDS as f64 * 2.5) as u64)
+        .execute()
+        .await
+    {
+        console_error!("failed to put kv for key {device:?}: {e:?}");
+    };
+}
 
 async fn forward(device: String, body: Vec<u8>, env: Env) {
-    let Ok(bot_token) = env.secret(&format!("{device}_bot_token")) else {
-        console_error!("bot_token not found for {device:?}");
-        return;
-    };
-    let Ok(chat_id) = env.secret(&format!("{device}_chat_id")) else {
-        console_error!("chat_id not found for {device:?}");
-        return;
-    };
     let text = match serde_json::from_slice::<AppleMessageFilterQuery>(&body) {
-        Ok(query) => {
-            format!("{device} {query}")
+        Ok(message) => {
+            format!("{device} {message}")
         }
         Err(_) => {
             format!(
@@ -114,28 +238,7 @@ async fn forward(device: String, body: Vec<u8>, env: Env) {
             )
         }
     };
-    let body = serde_json::to_string(&SendMessageBody {
-        chat_id: chat_id.to_string(),
-        text,
-        parse_mode: "HTML".to_string(),
-    })
-    .unwrap();
-    let Ok(request) = Request::new_with_init(
-        &format!("https://api.telegram.org/bot{bot_token}/sendMessage"),
-        &RequestInit {
-            method: Method::Post,
-            headers: [("Content-Type", "application/json")].into_iter().collect(),
-            body: Some(body.into()),
-            ..RequestInit::default()
-        },
-    ) else {
-        console_error!("sendMessage request construct failed");
-        return;
-    };
-    match Fetch::Request(request).send().await {
-        Ok(response) => console_log!("{response:?}"),
-        Err(e) => console_error!("sendMessage failed: {e:?}"),
-    };
+    send_message(&env, &device, &text).await;
 }
 
 #[event(fetch)]
@@ -144,26 +247,11 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
         return Response::empty();
     };
     if req.method() == Method::Get {
-        Ok(Response::builder()
-            .with_headers(
-                [
-                    ("Content-Type", "text/plain; charset=utf-8"),
-                    ("Content-Disposition", "inline; filename=\"sms-forward.yaml\""),
-                ]
-                .into_iter()
-                .collect(),
-            )
-            .fixed(
-                generate_config(device, token, env)
-                    .await
-                    .unwrap_or_default()
-                    .into_bytes(),
-            ))
+        generate_config(device, token, env).await
     } else {
+        ctx.wait_until(heartbeat(device.clone(), env.clone()));
         let body = req.bytes().await.unwrap();
-        if body.is_empty() {
-            ctx.wait_until(heartbeat(device, env));
-        } else {
+        if !body.is_empty() {
             ctx.wait_until(forward(device, body, env));
         }
         Response::empty()
@@ -172,7 +260,17 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
 
 #[allow(unused)]
 #[event(scheduled)]
-async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {}
+async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    let kv = env.kv("sms-forward-heartbeat").unwrap();
+    for device in get_secret(&env, "devices").split(",") {
+        let status = HeartbeatStatus::get(&kv, device).await;
+        console_debug!("scheduled check for {device}, previous {status:?}");
+        if status == Inactive {
+            send_message(&env, device, &format!("🔴 {device} is DOWN‼ ⚠️")).await;
+            send_sticker(&env, device, &get_secret(&env, "down_sticker")).await;
+        }
+    }
+}
 
 #[event(start)]
 fn start() {
