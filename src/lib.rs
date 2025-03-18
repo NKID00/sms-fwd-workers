@@ -319,7 +319,7 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         let status = HeartbeatStatus::get(&kv, device).await;
         console_log!("check for {device}, previous {status:?}");
         if status == Inactive {
-            send_message(&env, device, &format!("🔴 {device} is DOWN‼ ⚠️")).await;
+            send_message(&env, device, &format!("🔴 {device} is DOWN ⚠️")).await;
             send_sticker(&env, device, &get_secret(&env, "down_sticker")).await;
         }
     }
