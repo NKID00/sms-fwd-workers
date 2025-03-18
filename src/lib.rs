@@ -65,6 +65,47 @@ struct SendStickerBody<'a> {
     sticker: &'a str,
 }
 
+#[derive(Debug, Deserialize)]
+struct SendResponse {
+    ok: bool,
+    result: Option<SendResponseInner>,
+}
+
+impl SendResponse {
+    fn ok(&self) -> bool {
+        self.ok
+    }
+
+    fn message_id(&self) -> i64 {
+        self.result.as_ref().unwrap().message_id
+    }
+
+    fn chat_id(&self) -> i64 {
+        self.result.as_ref().unwrap().chat.id
+    }
+}
+
+impl Display for SendResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.ok() {
+            write!(f, "sent {} to {}", self.message_id(), self.chat_id())
+        } else {
+            write!(f, "failed")
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SendResponseInner {
+    message_id: i64,
+    chat: SendResponseInnerChat,
+}
+
+#[derive(Debug, Deserialize)]
+struct SendResponseInnerChat {
+    id: i64,
+}
+
 fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -133,7 +174,13 @@ async fn send_message(env: &Env, device: &str, text: &str) {
     )
     .unwrap();
     match Fetch::Request(request).send().await {
-        Ok(response) => console_debug!("{response:?}"),
+        Ok(mut response) => {
+            let Ok(send_response) = response.json::<SendResponse>().await else {
+                console_error!("sendMessage invalid response: {response:?}");
+                return;
+            };
+            console_log!("sendMessage: {}", send_response)
+        }
         Err(e) => console_error!("sendMessage failed: {e:?}"),
     };
 }
@@ -157,7 +204,13 @@ async fn send_sticker(env: &Env, device: &str, sticker: &str) {
     )
     .unwrap();
     match Fetch::Request(request).send().await {
-        Ok(response) => console_debug!("{response:?}"),
+        Ok(mut response) => {
+            let Ok(send_response) = response.json::<SendResponse>().await else {
+                console_error!("sendSticker invalid response: {response:?}");
+                return;
+            };
+            console_log!("sendSticker: {}", send_response)
+        }
         Err(e) => console_error!("sendSticker failed: {e:?}"),
     };
 }
@@ -209,7 +262,7 @@ async fn generate_config(device: String, token: String, env: Env) -> Result<Resp
 async fn heartbeat(device: String, env: Env) {
     let kv = env.kv("sms-forward-heartbeat").unwrap();
     let status = HeartbeatStatus::get(&kv, &device).await;
-    console_debug!("heartbeat for {device}, previous {status:?}");
+    console_log!("refresh {device}, previous {status:?}");
     if status != Active {
         send_message(&env, &device, &format!("🟢 {device} is now up")).await;
         send_sticker(&env, &device, &get_secret(&env, "up_sticker")).await;
@@ -264,7 +317,7 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let kv = env.kv("sms-forward-heartbeat").unwrap();
     for device in get_secret(&env, "devices").split(",") {
         let status = HeartbeatStatus::get(&kv, device).await;
-        console_debug!("scheduled check for {device}, previous {status:?}");
+        console_log!("check for {device}, previous {status:?}");
         if status == Inactive {
             send_message(&env, device, &format!("🔴 {device} is DOWN‼ ⚠️")).await;
             send_sticker(&env, device, &get_secret(&env, "down_sticker")).await;
