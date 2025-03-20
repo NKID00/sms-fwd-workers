@@ -1,17 +1,28 @@
 name = "sms-fwd-workers"
 main = "build/worker/shim.mjs"
 compatibility_date = "2025-03-15"
+preview_urls = false
 
 [[routes]]
 pattern = "sms.nk0.uk"
 custom_domain = true
 
-[build]
-command = "cargo install -q worker-build && worker-build --release"
-
 [[kv_namespaces]]
 binding = "sms-forward-heartbeat"
 id = "b2c8d62f05064a43b2e98ddb459165d8"
 
+[[send_email]]
+name = "command"
+
+[version_metadata]
+binding = "version"
+
+[build]
+command = "worker-build --release"
+
 [triggers]
 crons = ["2-59/5 * * * *"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1

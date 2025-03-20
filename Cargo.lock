@@ -357,6 +357,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "indoc"
+version = "2.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4c7245a08504955605670dbf141fceab975f15ca21570696aebe9d2e71576bd"
+
+[[package]]
 name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -633,12 +639,12 @@ name = "sms-fwd-workers"
 version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
+ "indoc",
  "itertools",
  "js-sys",
  "regex",
  "serde",
  "serde-wasm-bindgen 0.6.5",
- "serde_json",
  "worker",
  "worker-macros",
 ]
