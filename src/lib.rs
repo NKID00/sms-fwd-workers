@@ -646,7 +646,10 @@ async fn fetch(mut req: Request, env: Env, ctx: Context) -> Result<Response> {
 #[event(scheduled)]
 async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let kv = env.kv("sms-forward-heartbeat").unwrap();
-    for device in get_secret(&env, "devices").split(",") {
+    for device in get_secret(&env, "devices")
+        .split(",")
+        .skip_while(|s| s.is_empty())
+    {
         let status = HeartbeatStatus::get(&kv, device).await;
         console_log!("check {device}, previous {status:?}");
         if status == Inactive {
