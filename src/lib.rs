@@ -38,7 +38,12 @@ impl Display for AppleMessageFilterQuery {
             .get()
             .unwrap()
             .replace_all(&escaped, |c: &Captures| {
-                format!(" 👉 <code>{}</code> 👈 ", c.get(0).unwrap().as_str())
+                format!(
+                    "{} 👉 <code>{}</code> 👈  {}",
+                    c.get(1).unwrap().as_str(),
+                    c.get(2).unwrap().as_str(),
+                    c.get(3).unwrap().as_str(),
+                )
             });
         write!(f, "<code>{sender}</code>\n\n{text}", sender = self.sender())
     }
@@ -268,7 +273,7 @@ async fn send_message_by_device(env: &Env, device: &str, text: &str) -> Option<i
 }
 
 async fn send_sticker(env: &Env, device: &str, sticker: &str) {
-    let bot_token = get_bot_token(&env);
+    let bot_token = get_bot_token(env);
     let chat_id = get_secret(env, &format!("{device}_chat_id"));
     let body = to_json(&SendStickerBody {
         chat_id: &chat_id.to_string(),
@@ -662,7 +667,9 @@ async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
 #[event(start)]
 fn start() {
     console_error_panic_hook::set_once();
-    RE_CODE.get_or_init(|| Regex::new(r"(?:[[:alnum:]]-)?[[:digit:]]{6}").unwrap());
+    RE_CODE.get_or_init(|| {
+        Regex::new(r"([[:^digit:]]|\<)((?:[[:alnum:]]-)?[[:digit:]]{6})([[:^digit:]]|\>)").unwrap()
+    });
     COMMAND_MAIL.get_or_init(|| {
         indoc! {r#"
         From: "Remote Command" <{{from}}>
